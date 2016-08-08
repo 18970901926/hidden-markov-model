@@ -111,43 +111,60 @@ class HMM:
             yield(prev[i, last_state])
             last_state = prev[i, last_state]
 
-    def baum_welch_train(self, obs_seq):
-        N = self.A.shape[0]
-        T = len(obs_seq)
+    def simulate(self, T):
 
-        forw = self._forward(obs_seq)
-        back = self._backward(obs_seq)
+        def draw_from(probs):
+            return np.where(np.random.multinomial(1,probs) == 1)[0][0]
 
-        # P( entire observation sequence | A, B, pi )
-        obs_prob = np.sum(forw[:,-1])
-        if obs_prob <= 0:
-            raise ValueError("P(O | lambda) = 0. Cannot optimize!")
+        observations = np.zeros(T, dtype=int)
+        states = np.zeros(T, dtype=int)
+        states[0] = draw_from(self.pi)
+        observations[0] = draw_from(self.B[states[0],:])
+        for t in range(1, T):
+            states[t] = draw_from(self.A[states[t-1],:])
+            observations[t] = draw_from(self.B[states[t],:])
+        return observations,states
 
-        xi = np.zeros((T-1, N, N))
-        for t in range(xi.shape[0]):
-            xi[t,:,:] = self.A * forw[:,[t]] * self.B[:,obs_seq[t+1]] * back[:, t+1] / obs_prob
+    def baum_welch_train(self, observations, criterion=0.05):
+        n_states = self.A.shape[0]
+        n_samples = len(observations)
 
-        gamma = forw * back / obs_prob
+        done = False
+        while not done:
+            # alpha_t(i) = P(O_1 O_2 ... O_t, q_t = S_i | hmm)
+            # Initialize alpha
+            alpha = self._forward(observations)
 
-        # Gamma sum excluding last column
-        gamma_sum_A = np.sum(gamma[:,:-1], axis=1, keepdims=True)
-        # Vector of binary values indicating whether a row in gamma_sum is 0.
-        # If a gamma_sum row is 0, save old rows on update
-        rows_to_keep_A =  (gamma_sum_A == 0)
-        # Convert all 0s to 1s to avoid division by zero
-        gamma_sum_A[gamma_sum_A == 0] = 1.
-        next_A = np.sum(xi, axis=0) / gamma_sum_A
+            # beta_t(i) = P(O_t+1 O_t+2 ... O_T | q_t = S_i , hmm)
+            # Initialize beta
+            beta = self._backward(observations)
 
+            xi = np.zeros((n_states,n_states,n_samples-1))
+            for t in range(n_samples-1):
+                denom = np.dot(np.dot(alpha[:,t].T, self.A) * self.B[:,observations[t+1]].T, beta[:,t+1])
+                for i in range(n_states):
+                    numer = alpha[i,t] * self.A[i,:] * self.B[:,observations[t+1]].T * beta[:,t+1].T
+                    xi[i,:,t] = numer / denom
 
-        gamma_sum_B = np.sum(gamma, axis=1, keepdims=True)
-        rows_to_keep_B = (gamma_sum_B == 0)
-        gamma_sum_B[gamma_sum_B == 0] = 1.
+            # gamma_t(i) = P(q_t = S_i | O, hmm)
+            gamma = np.squeeze(np.sum(xi,axis=1))
+            # Need final gamma element for new B
+            prod =  (alpha[:,n_samples-1] * beta[:,n_samples-1]).reshape((-1,1))
+            gamma = np.hstack((gamma,  prod / np.sum(prod))) #append one more to gamma!!!
 
-        obs_mat = np.zeros((T, self.B.shape[1]))
-        obs_mat[range(T),obs_seq] = 1
-        next_B = np.dot(gamma, obs_mat) / gamma_sum_B
+            newpi = gamma[:,0]
+            newA = np.sum(xi,2) / np.sum(gamma[:,:-1],axis=1).reshape((-1,1))
+            newB = np.copy(self.B)
 
-        # Update model
-        self.A = self.A * rows_to_keep_A + next_A
-        self.B = self.B * rows_to_keep_B + next_B
-        self.pi = gamma[:,0] / np.sum(gamma[:,0])
+            num_levels = self.B.shape[1]
+            sumgamma = np.sum(gamma,axis=1)
+            for lev in range(num_levels):
+                mask = observations == lev
+                newB[:,lev] = np.sum(gamma[:,mask],axis=1) / sumgamma
+
+            if np.max(abs(self.pi - newpi)) < criterion and \
+                            np.max(abs(self.A - newA)) < criterion and \
+                            np.max(abs(self.B - newB)) < criterion:
+                done = 1
+
+            self.A[:],self.B[:],self.pi[:] = newA,newB,newpi
